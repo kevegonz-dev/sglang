@@ -170,8 +170,15 @@ class Qwen4PLEMMapStorage:
         if not self.reused:
             _write_json_exclusive(self.initializing_path, self.metadata)
         try:
+            # A completed table is immutable serving state. MAP_PRIVATE keeps
+            # GB10/CUDA's writable pageable-memory pins from dirtying the
+            # authoritative file even though inference only reads this tensor.
+            # New tables remain MAP_SHARED so checkpoint shards persist.
             raw = torch.from_file(
-                str(self.path), shared=True, size=self.nbytes, dtype=torch.uint8
+                str(self.path),
+                shared=not self.reused,
+                size=self.nbytes,
+                dtype=torch.uint8,
             )
             self.tensor = raw.view(dtype).view(*self.shape)
             self._apply_madv_random(raw.data_ptr())

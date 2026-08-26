@@ -67,6 +67,23 @@ def test_ready_mmap_reopens_without_reinitializing(mmap_directory):
     assert reopened.ready_path.read_bytes() == ready_before
 
 
+def test_ready_mmap_reopens_private_and_cannot_modify_file(mmap_directory):
+    storage = make_storage(mmap_directory)
+    source = torch.arange(storage.nbytes, dtype=torch.uint8)
+    storage.tensor.view(torch.uint8).reshape(-1).copy_(source)
+    storage.finalize()
+    mtime_before = storage.path.stat().st_mtime_ns
+
+    reopened = make_storage(mmap_directory)
+    reopened_bytes = reopened.tensor.view(torch.uint8).reshape(-1)
+    reopened_bytes[0] = 255
+
+    assert reopened_bytes[0].item() == 255
+    persisted_first_byte = storage.tensor.view(torch.uint8).reshape(-1)[0].item()
+    assert persisted_first_byte == source[0].item()
+    assert storage.path.stat().st_mtime_ns == mtime_before
+
+
 def test_interrupted_initialization_fails_closed(mmap_directory):
     storage = make_storage(mmap_directory)
     assert storage.initializing_path.is_file()
