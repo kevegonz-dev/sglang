@@ -1563,6 +1563,26 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_tilelang_prefill_masks_non_block_aligned_key_width():
+    from sglang.srt.layers.attention.qsa.mqa import HAS_TILELANG
+
+    if not HAS_TILELANG:
+        pytest.skip("TileLang is required")
+    # The mask kernel covers logits in 4,096-column blocks. Keep the MQA
+    # GEMM's 64-column tile aligned while forcing a partial mask block.
+    rows, keys, heads, head_dim = 32, 4160, 4, 16
+    q = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), keys, dtype=torch.int32, device="cuda")
+
+    logits = qsa_mqa_prefill(q, k, starts, ends)
+    torch.cuda.synchronize()
+    assert logits.shape == (rows, keys)
+    assert torch.isfinite(logits).all()
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
