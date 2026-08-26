@@ -1444,26 +1444,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        packed_k, packed_v = self._pack_context_kv(
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_indices,
+            sequence_lens,
+        )
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1497,13 +1492,55 @@ class QwenSparseAttnBackend(AttentionBackend):
         key = (num_kv_heads, head_dim, dtype, device)
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
-            shape = (capacity, num_kv_heads, head_dim)
+            # Chunked prefill grows its packed history every forward. Exact-size
+            # reallocations leave one unusable cached block per chunk and turn
+            # allocator residency into O(sequence_length**2). Power-of-two
+            # growth bounds retired blocks below the current allocation.
+            rounded_capacity = 1 << (max(int(capacity), 1) - 1).bit_length()
+            shape = (rounded_capacity, num_kv_heads, head_dim)
             buffers = (
                 torch.empty(shape, dtype=dtype, device=device),
                 torch.empty(shape, dtype=dtype, device=device),
             )
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
+
+    def _pack_context_kv(
+        self,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_indices: list[int],
+        sequence_lens: list[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather chunk-prefill history into geometrically grown scratch.
+
+        ``index_select`` followed by ``torch.cat`` allocated two copies of the
+        entire prefix on every chunk. Since the prefix only grows, PyTorch's
+        caching allocator could not reuse the smaller blocks and a single long
+        request accumulated quadratic reserved memory. Write each request
+        directly into the reusable packed buffers instead.
+        """
+        if len(req_indices) != len(sequence_lens):
+            raise ValueError("QSA request indices and sequence lengths disagree")
+        total_tokens = sum(sequence_lens)
+        if total_tokens <= 0:
+            raise ValueError("QSA packed context must contain at least one token")
+        packed_k, packed_v = self._get_fa2_scratch(
+            total_tokens,
+            k_buffer.shape[1],
+            k_buffer.shape[2],
+            k_buffer.dtype,
+            k_buffer.device,
+        )
+        offset = 0
+        for req_idx, sequence_len in zip(req_indices, sequence_lens):
+            end = offset + sequence_len
+            slots = req_to_token[req_idx, :sequence_len].long()
+            torch.index_select(k_buffer, 0, slots, out=packed_k[offset:end])
+            torch.index_select(v_buffer, 0, slots, out=packed_v[offset:end])
+            offset = end
+        return packed_k, packed_v
 
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
