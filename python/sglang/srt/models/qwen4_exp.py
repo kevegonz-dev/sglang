@@ -60,6 +60,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_ple_mmap import Qwen4PLEMMapStorage
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -748,7 +749,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from pinned host memory.
+    """PLE table read directly from pinned or guarded mmap host memory.
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -773,7 +774,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         "num_added_embeddings_per_partition",
     )
 
-    def __init__(self, embedding: VocabParallelEmbedding) -> None:
+    def __init__(
+        self,
+        embedding: VocabParallelEmbedding,
+        *,
+        backend: str = "pinned",
+        mmap_dir: Optional[str] = None,
+        ple_layer_index: int = 0,
+    ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
@@ -793,15 +801,34 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # The unquantized CUDA post-load hook is a no-op. Exclude this CPU-only
         # table so the generic loader does not stage it back to GPU unnecessarily.
         self.quant_method = None
+        if backend not in ("pinned", "mmap"):
+            raise ValueError(f"unsupported PLE offload backend: {backend}")
+        if backend == "pinned" and mmap_dir is not None:
+            raise ValueError("mmap_dir is valid only for the mmap PLE backend")
+        self.offload_backend = backend
+        self._mmap_storage = None
 
         source_weight = embedding.weight
-        cpu_weight = nn.Parameter(
-            torch.empty(
+        if backend == "mmap":
+            start = self.shard_indices.org_vocab_start_index
+            end = self.shard_indices.org_vocab_end_index
+            identity = f"ple-layer-{ple_layer_index:02d}-rows-{start}-{end}"
+            self._mmap_storage = Qwen4PLEMMapStorage(
+                directory=mmap_dir,
+                shape=source_weight.shape,
+                dtype=source_weight.dtype,
+                identity=identity,
+            )
+            host_weight = self._mmap_storage.tensor
+        else:
+            host_weight = torch.empty(
                 source_weight.shape,
                 dtype=source_weight.dtype,
                 device="cpu",
                 pin_memory=True,
-            ),
+            )
+        cpu_weight = nn.Parameter(
+            host_weight,
             requires_grad=False,
         )
         for name, value in vars(source_weight).items():
@@ -813,6 +840,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+
+    def finalize_mmap(self) -> None:
+        if self._mmap_storage is not None:
+            self._mmap_storage.finalize()
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -893,7 +924,10 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         if config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                self.ple_embedding.ngram_embedding
+                self.ple_embedding.ngram_embedding,
+                backend=getattr(config, "ple_offload_backend", None) or "pinned",
+                mmap_dir=getattr(config, "ple_mmap_dir", None),
+                ple_layer_index=ple_layer_index,
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
@@ -1922,6 +1956,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
             copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
+            loaded_ple_shards[mod_prefix].add(shard_idx)
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
 
@@ -1944,6 +1979,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         loaded_buffers: Set[str] = set()
         loaded_shard_params: Set[str] = set()
+        loaded_ple_shards = {name: set() for name in ple_modules}
         skipped_visual_count = 0
 
         for name, loaded_weight in weights:
@@ -2114,6 +2150,23 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+
+        expected_ple_shards = set(range(ple_num_sync_shards))
+        for module_name, module in ple_modules.items():
+            embedding = module.ngram_embedding
+            if not isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
+                continue
+            if embedding.offload_backend != "mmap":
+                continue
+            actual_ple_shards = loaded_ple_shards[module_name]
+            if actual_ple_shards != expected_ple_shards:
+                missing = sorted(expected_ple_shards - actual_ple_shards)
+                unexpected = sorted(actual_ple_shards - expected_ple_shards)
+                raise RuntimeError(
+                    "PLE mmap initialization is incomplete: "
+                    f"missing_shards={missing}, unexpected_shards={unexpected}"
+                )
+            embedding.finalize_mmap()
 
         return loaded_params
 

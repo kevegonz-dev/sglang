@@ -43,6 +43,31 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_ple_mmap_backend_requires_fixed_directory(self):
+        with self.assertRaisesRegex(ValueError, "requires --ple-mmap-dir"):
+            ServerArgs(model_path="dummy", ple_offload_backend="mmap")
+
+    def test_ple_mmap_directory_requires_mmap_backend(self):
+        with self.assertRaisesRegex(ValueError, "valid only with"):
+            ServerArgs(model_path="dummy", ple_mmap_dir="/lane-owned/ple")
+
+    def test_ple_backend_rejects_explicit_disable(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            ServerArgs(
+                model_path="dummy",
+                ple_offload_embedding=False,
+                ple_offload_backend="mmap",
+                ple_mmap_dir="/lane-owned/ple",
+            )
+
+    def test_ple_mmap_backend_enables_embedding_offload(self):
+        args = ServerArgs(
+            model_path="dummy",
+            ple_offload_backend="mmap",
+            ple_mmap_dir="/lane-owned/ple",
+        )
+        self.assertTrue(args.ple_offload_embedding)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},

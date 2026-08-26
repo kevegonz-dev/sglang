@@ -290,6 +290,10 @@ def load_model_with_memory_saver(
             model_config.hf_text_config.ple_offload_embedding = (
                 server_args.ple_offload_embedding
             )
+            model_config.hf_text_config.ple_offload_backend = (
+                server_args.ple_offload_backend
+            )
+            model_config.hf_text_config.ple_mmap_dir = server_args.ple_mmap_dir
 
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup

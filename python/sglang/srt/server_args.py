@@ -2620,6 +2620,24 @@ class ServerArgs:
         ),
         NS("exec.offload"),
     ] = None
+    ple_offload_backend: A[
+        Optional[str],
+        Arg(
+            help="Explicit Qwen4 PLE offload storage backend. 'pinned' keeps "
+            "the existing CPU pinned allocation; 'mmap' uses the guarded "
+            "GB10 file-backed backend and requires --ple-mmap-dir.",
+            choices=["pinned", "mmap"],
+        ),
+        NS("exec.offload"),
+    ] = None
+    ple_mmap_dir: A[
+        Optional[str],
+        Arg(
+            help="Fixed lane-owned backing directory for --ple-offload-backend "
+            "mmap. This startup-only path is not request configurable.",
+        ),
+        NS("exec.offload"),
+    ] = None
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -3786,6 +3804,22 @@ class ServerArgs:
         self._handle_offload_compatibility()
 
     def _handle_offload_compatibility(self):
+        if self.ple_offload_backend is not None:
+            if self.ple_offload_embedding is False:
+                raise ValueError(
+                    "--ple-offload-backend cannot be combined with "
+                    "--no-ple-offload-embedding"
+                )
+            self.ple_offload_embedding = True
+        elif self.ple_offload_embedding:
+            self.ple_offload_backend = "pinned"
+
+        if self.ple_offload_backend == "mmap" and not self.ple_mmap_dir:
+            raise ValueError("--ple-offload-backend mmap requires --ple-mmap-dir")
+        if self.ple_offload_backend != "mmap" and self.ple_mmap_dir:
+            raise ValueError(
+                "--ple-mmap-dir is valid only with --ple-offload-backend mmap"
+            )
         if self.ple_offload_embedding and (
             self.cpu_offload_gb > 0 or self.offload_group_size > 0
         ):
