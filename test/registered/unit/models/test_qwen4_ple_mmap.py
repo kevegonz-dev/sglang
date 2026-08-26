@@ -41,10 +41,30 @@ def test_mmap_preserves_exact_dtype_shape_and_bytes(mmap_directory, dtype):
     storage.finalize()
 
     reopened = make_storage(mmap_directory, dtype=dtype)
+    assert reopened.reused
+    assert not reopened.initializing_path.exists()
     assert reopened.tensor.dtype == dtype
     assert tuple(reopened.tensor.shape) == storage.shape
     assert torch.equal(reopened.tensor.view(torch.uint8).reshape(-1), source)
     reopened.finalize()
+
+
+def test_ready_mmap_reopens_without_reinitializing(mmap_directory):
+    storage = make_storage(mmap_directory)
+    source = torch.arange(storage.nbytes, dtype=torch.uint8)
+    storage.tensor.view(torch.uint8).reshape(-1).copy_(source)
+    storage.finalize()
+    ready_before = storage.ready_path.read_bytes()
+
+    reopened = make_storage(mmap_directory)
+
+    assert reopened.reused
+    assert not reopened.initializing_path.exists()
+    assert reopened.ready_path.read_bytes() == ready_before
+    assert torch.equal(reopened.tensor.view(torch.uint8).reshape(-1), source)
+    reopened.finalize()
+    assert not reopened.initializing_path.exists()
+    assert reopened.ready_path.read_bytes() == ready_before
 
 
 def test_interrupted_initialization_fails_closed(mmap_directory):

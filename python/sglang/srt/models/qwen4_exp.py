@@ -845,6 +845,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if self._mmap_storage is not None:
             self._mmap_storage.finalize()
 
+    @property
+    def mmap_reused(self) -> bool:
+        return self._mmap_storage is not None and self._mmap_storage.reused
+
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
     ) -> torch.Tensor:
@@ -1908,6 +1912,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb.mmap_reused:
+                if loaded_weight.dtype != emb.weight.dtype:
+                    raise TypeError(
+                        "reused PLE mmap dtype does not match checkpoint shard: "
+                        f"{emb.weight.dtype} != {loaded_weight.dtype}"
+                    )
+                loaded_ple_shards[mod_prefix].add(shard_idx)
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn

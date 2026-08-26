@@ -166,8 +166,9 @@ class Qwen4PLEMMapStorage:
                 "lane-owned backing file and marker before rebuilding"
             )
         self._validate_disk()
-        self._prepare_file()
-        _write_json_exclusive(self.initializing_path, self.metadata)
+        self.reused = self._prepare_file()
+        if not self.reused:
+            _write_json_exclusive(self.initializing_path, self.metadata)
         try:
             raw = torch.from_file(
                 str(self.path), shared=True, size=self.nbytes, dtype=torch.uint8
@@ -191,7 +192,7 @@ class Qwen4PLEMMapStorage:
                 str(self.directory),
             )
 
-    def _prepare_file(self) -> None:
+    def _prepare_file(self) -> bool:
         if self.path.exists():
             _validate_regular_owned_file(self.path, self.nbytes)
             if not self.ready_path.is_file():
@@ -202,7 +203,7 @@ class Qwen4PLEMMapStorage:
                 raise RuntimeError("invalid PLE mmap ready metadata") from error
             if ready != self.metadata:
                 raise ValueError("PLE mmap ready metadata does not match dtype/shape")
-            return
+            return True
         if self.ready_path.exists():
             raise RuntimeError(
                 "PLE mmap ready metadata exists without its backing file"
@@ -218,6 +219,7 @@ class Qwen4PLEMMapStorage:
         finally:
             os.close(descriptor)
         _validate_regular_owned_file(self.path, self.nbytes)
+        return False
 
     def _apply_madv_random(self, pointer: int) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -237,6 +239,12 @@ class Qwen4PLEMMapStorage:
         """Make completed state durable only after every expected shard loaded."""
 
         _validate_regular_owned_file(self.path, self.nbytes)
+        if self.reused:
+            # Existing state was accepted only after exact ready-metadata,
+            # ownership, permissions, dtype, shape, and size validation. Do
+            # not rewrite metadata or invent an initialization marker for a
+            # read-only restart.
+            return
         descriptor = os.open(self.path, os.O_RDONLY)
         try:
             os.fsync(descriptor)
