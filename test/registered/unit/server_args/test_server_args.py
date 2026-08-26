@@ -68,6 +68,17 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         self.assertTrue(args.ple_offload_embedding)
 
+    def test_ple_mmap_handler_is_idempotent_after_materialization(self):
+        args = ServerArgs(
+            model_path="dummy",
+            ple_offload_backend="mmap",
+            ple_mmap_dir="/lane-owned/ple",
+        )
+        object.__setattr__(args, "_declarations_materialized", True)
+        args._handle_offload_compatibility()
+        self.assertTrue(args.ple_offload_embedding)
+        self.assertEqual(args.ple_offload_backend, "mmap")
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},

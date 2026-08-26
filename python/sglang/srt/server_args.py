@@ -3810,8 +3810,14 @@ class ServerArgs:
                     "--ple-offload-backend cannot be combined with "
                     "--no-ple-offload-embedding"
                 )
-            self.ple_offload_embedding = True
-        elif self.ple_offload_embedding:
+            # This handler runs both before and after declaration
+            # materialization. Resolve an explicit backend on the first pass,
+            # but do not reassign the now read-only field on the second.
+            if self.ple_offload_embedding is not True:
+                self.ple_offload_embedding = True
+        elif self.ple_offload_embedding and not getattr(
+            self, "_declarations_materialized", False
+        ):
             self.ple_offload_backend = "pinned"
 
         if self.ple_offload_backend == "mmap" and not self.ple_mmap_dir:
