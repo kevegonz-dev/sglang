@@ -226,7 +226,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         ] = {}
         self._cuda_graph_max_tokens = 0
         self._fa2_scratch: Dict[
-            Tuple[int, int, torch.dtype, torch.device],
+            Tuple[bool, int, int, torch.dtype, torch.device],
             Tuple[torch.Tensor, torch.Tensor],
         ] = {}
         self._graph_seq_lens = None
@@ -1489,8 +1489,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        *,
+        is_cuda_graph: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        key = (num_kv_heads, head_dim, dtype, device)
+        # CUDA graphs retain raw allocation addresses rather than Python tensor
+        # references.  Eager chunk-prefill scratch grows with the sequence and
+        # replaces its cache entry; sharing that entry drops the graph buffer's
+        # last live reference.  A later torch.cuda.empty_cache() can then unmap
+        # the captured address and make the next replay fault.  Keep graph-owned
+        # scratch in a separate, never-grown lifetime.
+        key = (is_cuda_graph, num_kv_heads, head_dim, dtype, device)
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
             # Chunked prefill grows its packed history every forward. Exact-size
@@ -1598,6 +1606,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.shape[2],
             k_buffer.dtype,
             k_buffer.device,
+            is_cuda_graph=metadata.is_cuda_graph,
         )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
@@ -1727,6 +1736,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.shape[2],
             k_buffer.dtype,
             k_buffer.device,
+            is_cuda_graph=metadata.is_cuda_graph,
         )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
