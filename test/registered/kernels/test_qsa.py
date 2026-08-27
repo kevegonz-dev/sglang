@@ -950,7 +950,7 @@ def test_qsa_chunk_prefill_packs_history_into_geometric_scratch():
     torch.testing.assert_close(packed_k, k_buffer[expected_slots])
     torch.testing.assert_close(packed_v, v_buffer[expected_slots])
 
-    key = (1, 2, torch.float32, torch.device("cpu"))
+    key = (False, 1, 2, torch.float32, torch.device("cpu"))
     first_buffers = backend._fa2_scratch[key]
     assert first_buffers[0].shape[0] == 8
     smaller_k, _ = backend._pack_context_kv(k_buffer, v_buffer, req_to_token, [0], [4])
@@ -961,6 +961,28 @@ def test_qsa_chunk_prefill_packs_history_into_geometric_scratch():
     grown_buffers = backend._fa2_scratch[key]
     assert grown_buffers[0].shape[0] == 16
     assert grown_buffers[0] is not first_buffers[0]
+
+
+def test_qsa_cuda_graph_scratch_survives_eager_prefill_growth():
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._fa2_scratch = {}
+    args = (1, 2, torch.float32, torch.device("cpu"))
+
+    graph_k, graph_v = backend._get_fa2_scratch(8, *args, is_cuda_graph=True)
+    graph_key = (True, *args)
+    graph_buffers = backend._fa2_scratch[graph_key]
+
+    # A long chunk prefill crosses multiple power-of-two capacities.  Those
+    # replacements must affect only eager scratch: a captured graph still owns
+    # and reuses the exact allocation addresses it recorded at startup.
+    backend._get_fa2_scratch(16, *args)
+    backend._get_fa2_scratch(64, *args)
+    replay_k, replay_v = backend._get_fa2_scratch(8, *args, is_cuda_graph=True)
+
+    assert backend._fa2_scratch[graph_key] is graph_buffers
+    assert replay_k.data_ptr() == graph_k.data_ptr()
+    assert replay_v.data_ptr() == graph_v.data_ptr()
+    assert backend._fa2_scratch[(False, *args)][0].shape[0] == 64
 
 
 def _make_paged_extend_backend():
